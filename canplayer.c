@@ -41,6 +41,7 @@
  *
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -104,49 +105,31 @@ void print_usage(char *prg)
 		"timestamp) are ignored.\n\n");
 }
 
-/* copied from /usr/src/linux/include/linux/time.h ...
- * lhs < rhs:  return <0
- * lhs == rhs: return 0
- * lhs > rhs:  return >0
- */
-static inline int timeval_compare(struct timeval *lhs, struct timeval *rhs)
+static void ts_add(struct timespec *ts1, struct timespec *ts2, struct timespec *result)
 {
-	if (lhs->tv_sec < rhs->tv_sec)
-		return -1;
-	if (lhs->tv_sec > rhs->tv_sec)
-		return 1;
-	return lhs->tv_usec - rhs->tv_usec;
+	result->tv_sec  = ts1->tv_sec  + ts2->tv_sec;
+	result->tv_nsec = ts1->tv_nsec + ts2->tv_nsec;
+	if (result->tv_nsec >= 1000000000L) {
+		result->tv_sec++ ;  result->tv_nsec = result->tv_nsec - 1000000000L;
+	}
 }
 
-static inline void create_diff_tv(struct timeval *today, struct timeval *diff,
-				  struct timeval *log) {
-
-	/* create diff_tv so that log_tv + diff_tv = today_tv */
-	diff->tv_sec  = today->tv_sec  - log->tv_sec;
-	diff->tv_usec = today->tv_usec - log->tv_usec;
-}
-
-static inline int frames_to_send(struct timeval *today, struct timeval *diff,
-				 struct timeval *log)
+static void ts_subtract(struct timespec *ts1, struct timespec *ts2, struct timespec *result)
 {
-	/* return value <0 when log + diff < today */
+	if ( (ts1->tv_sec < ts2->tv_sec) ||
+		( (ts1->tv_sec  == ts2->tv_sec) &&
+		  (ts1->tv_nsec <= ts2->tv_nsec) ) ) {
+		result->tv_sec = result->tv_nsec = 0;
+	} else {
+		result->tv_sec = ts1->tv_sec - ts2->tv_sec;
 
-	struct timeval cmp;
-
-	cmp.tv_sec  = log->tv_sec  + diff->tv_sec;
-	cmp.tv_usec = log->tv_usec + diff->tv_usec;
-
-	if (cmp.tv_usec > 1000000) {
-		cmp.tv_usec -= 1000000;
-		cmp.tv_sec++;
+		if (ts1->tv_nsec < ts2->tv_nsec) {
+			result->tv_nsec = ts1->tv_nsec + 1000000000L - ts2->tv_nsec;
+			result->tv_sec--;
+		} else {
+			result->tv_nsec = ts1->tv_nsec - ts2->tv_nsec;
+		}
 	}
-
-	if (cmp.tv_usec < 0) {
-		cmp.tv_usec += 1000000;
-		cmp.tv_sec--;
-	}
-
-	return timeval_compare(&cmp, today);
 }
 
 int get_txidx(char *logif_name) {
@@ -235,8 +218,7 @@ int main(int argc, char **argv)
 	static char buf[BUFSZ], device[BUFSZ], ascframe[BUFSZ];
 	struct sockaddr_can addr;
 	static struct canfd_frame frame;
-	static struct timeval today_tv, log_tv, last_log_tv, diff_tv;
-	struct timespec sleep_ts;
+	static struct timespec target_ts, log_ts, last_log_ts, diff_ts, sleep_ts;
 	int s; /* CAN_RAW socket */
 	FILE *infile = stdin;
 	unsigned long gap = DEFAULT_GAP; 
@@ -249,6 +231,7 @@ int main(int argc, char **argv)
 	int assignments; /* assignments defined on the commandline */
 	int txidx;       /* sendto() interface index */
 	int eof, txmtu, i, j;
+	int err;
 	char *fret;
 
 	while ((opt = getopt(argc, argv, "I:l:tg:s:xv?")) != -1) {
@@ -371,6 +354,14 @@ int main(int argc, char **argv)
 		}
 	}
 
+	//special value of last log timestamp
+	last_log_ts.tv_sec = last_log_ts.tv_nsec = -1;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &target_ts)) {
+		fprintf(stderr, "CLOCK_MONOTONIC get failed\n");
+		return 1;
+	}
+
 	while (infinite_loops || loops--) {
 
 		if (infile != stdin)
@@ -392,110 +383,125 @@ int main(int argc, char **argv)
 
 		eof = 0;
 
-		if (sscanf(buf, "(%ld.%ld) %s %s", &log_tv.tv_sec, &log_tv.tv_usec,
+		if (sscanf(buf, "(%ld.%ld) %s %s", &log_ts.tv_sec, &log_ts.tv_nsec,
 			   device, ascframe) != 4) {
 			fprintf(stderr, "incorrect line format in logfile\n");
 			return 1;
 		}
+		log_ts.tv_nsec *= 1000L; // convert usec to nsec
 
 		if (use_timestamps) { /* throttle sending due to logfile timestamps */
+			/* test for logfile timestamps jumping backwards OR      */
+			/* if the user likes to skip long gaps in the timestamps */
+			if ((last_log_ts.tv_sec == -1 && last_log_ts.tv_nsec == -1) ||
+			    (last_log_ts.tv_sec > log_ts.tv_sec) ||
+			    (skipgap && labs(last_log_ts.tv_sec - log_ts.tv_sec) > skipgap)) {
+				diff_ts.tv_sec = diff_ts.tv_nsec = 0;
+			} else {
+				ts_subtract(&log_ts, &last_log_ts, &diff_ts);
+			}
 
-			gettimeofday(&today_tv, NULL);
-			create_diff_tv(&today_tv, &diff_tv, &log_tv);
-			last_log_tv = log_tv;
+			last_log_ts = log_ts;
+
+			ts_add(&target_ts, &diff_ts, &target_ts);
+		} else {
+			ts_add(&target_ts, &sleep_ts, &target_ts);
 		}
 
 		while (!eof) {
-
-			while ((!use_timestamps) ||
-			       (frames_to_send(&today_tv, &diff_tv, &log_tv) < 0)) {
-
-				/* log_tv/device/ascframe are valid here */
-
-				if (strlen(device) >= IFNAMSIZ) {
-					fprintf(stderr, "log interface name '%s' too long!", device);
+			while ((err = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &target_ts, NULL))) {
+				if (err != EINTR) {
+					fprintf(stderr, "sleep TIMER_ABSTIME failed %d\n", err);
 					return 1;
 				}
+			}
 
-				txidx = get_txidx(device); /* get ifindex for sending the frame */
- 
-				if ((!txidx) && (!assignments)) {
-					/* ifindex not found and no user assignments */
-					/* => assign this device automatically       */
-					if (add_assignment("auto", s, device, device, verbose))
-						return 1;
-					txidx = get_txidx(device);
-				}
-
-				if (txidx == STDOUTIDX) { /* hook to print logfile lines on stdout */
-
-					printf("%s", buf); /* print the line AS-IS without extra \n */
-					fflush(stdout);
-
-				} else if (txidx > 0) { /* only send to valid CAN devices */
-
-					txmtu = parse_canframe(ascframe, &frame);
-					if (!txmtu) {
-						fprintf(stderr, "wrong CAN frame format: '%s'!", ascframe);
-						return 1;
-					}
-
-					addr.can_family  = AF_CAN;
-					addr.can_ifindex = txidx; /* send via this interface */
- 
-					if (sendto(s, &frame, txmtu, 0,	(struct sockaddr*)&addr, sizeof(addr)) != txmtu) {
-						perror("sendto");
-						return 1;
-					}
-
-					if (verbose) {
-						printf("%s (%s) ", get_txname(device), device);
-
-						if (txmtu == CAN_MTU)
-							fprint_long_canframe(stdout, &frame, "\n", CANLIB_VIEW_INDENT_SFF, CAN_MAX_DLEN);
-						else
-							fprint_long_canframe(stdout, &frame, "\n", CANLIB_VIEW_INDENT_SFF, CANFD_MAX_DLEN);
-					}
-				}
-
-				/* read next non-comment frame from logfile */
-				while ((fret = fgets(buf, BUFSZ-1, infile)) != NULL && buf[0] != '(') {
-					if (strlen(buf) >= BUFSZ-2) {
-						fprintf(stderr, "comment line too long for input buffer\n");
-						return 1;
-					}
-				}
-
-				if (!fret) {
-					eof = 1; /* this file is completely processed */
-					break;
-				}
-
-				if (sscanf(buf, "(%ld.%ld) %s %s", &log_tv.tv_sec, &log_tv.tv_usec,
-					   device, ascframe) != 4) {
-					fprintf(stderr, "incorrect line format in logfile\n");
-					return 1;
-				}
-
-				if (use_timestamps) {
-					gettimeofday(&today_tv, NULL);
-
-					/* test for logfile timestamps jumping backwards OR      */
-					/* if the user likes to skip long gaps in the timestamps */
-					if ((last_log_tv.tv_sec > log_tv.tv_sec) ||
-					    (skipgap && labs(last_log_tv.tv_sec - log_tv.tv_sec) > skipgap))
-						create_diff_tv(&today_tv, &diff_tv, &log_tv);
-
-					last_log_tv = log_tv;
-				}
-
-			} /* while frames_to_send ... */
-
-			if (nanosleep(&sleep_ts, NULL))
+			/* log_tv/device/ascframe are valid here */
+			if (strlen(device) >= IFNAMSIZ) {
+				fprintf(stderr, "log interface name '%s' too long!", device);
 				return 1;
+			}
+
+			txidx = get_txidx(device); /* get ifindex for sending the frame */
+
+			if ((!txidx) && (!assignments)) {
+				/* ifindex not found and no user assignments */
+				/* => assign this device automatically       */
+				if (add_assignment("auto", s, device, device, verbose))
+					return 1;
+				txidx = get_txidx(device);
+			}
+
+			if (txidx == STDOUTIDX) { /* hook to print logfile lines on stdout */
+
+				printf("%s", buf); /* print the line AS-IS without extra \n */
+				fflush(stdout);
+
+			} else if (txidx > 0) { /* only send to valid CAN devices */
+
+				txmtu = parse_canframe(ascframe, &frame);
+				if (!txmtu) {
+					fprintf(stderr, "wrong CAN frame format: '%s'!", ascframe);
+					return 1;
+				}
+
+				addr.can_family  = AF_CAN;
+				addr.can_ifindex = txidx; /* send via this interface */
+
+				if (sendto(s, &frame, txmtu, 0,	(struct sockaddr*)&addr, sizeof(addr)) != txmtu) {
+					perror("sendto");
+					return 1;
+				}
+
+				if (verbose) {
+					printf("%s (%s) ", get_txname(device), device);
+
+					if (txmtu == CAN_MTU)
+						fprint_long_canframe(stdout, &frame, "", CANLIB_VIEW_INDENT_SFF, CAN_MAX_DLEN);
+					else
+						fprint_long_canframe(stdout, &frame, "", CANLIB_VIEW_INDENT_SFF, CANFD_MAX_DLEN);
+
+					printf(" #+(%lld.%.9ld)\n", (long long)diff_ts.tv_sec, diff_ts.tv_nsec);
+				}
+			}
+
+			/* read next non-comment frame from logfile */
+			while ((fret = fgets(buf, BUFSZ-1, infile)) != NULL && buf[0] != '(') {
+				if (strlen(buf) >= BUFSZ-2) {
+					fprintf(stderr, "comment line too long for input buffer\n");
+					return 1;
+				}
+			}
+
+			if (!fret) {
+				eof = 1; /* this file is completely processed */
+				break;
+			}
+
+			if (sscanf(buf, "(%ld.%ld) %s %s", &log_ts.tv_sec, &log_ts.tv_nsec,
+				   device, ascframe) != 4) {
+				fprintf(stderr, "incorrect line format in logfile\n");
+				return 1;
+			}
+
+			if (use_timestamps) {
+				/* test for logfile timestamps jumping backwards OR      */
+				/* if the user likes to skip long gaps in the timestamps */
+				if ((last_log_ts.tv_sec > log_ts.tv_sec) ||
+				    (skipgap && labs(last_log_ts.tv_sec - log_ts.tv_sec) > skipgap)) {
+					diff_ts.tv_sec = diff_ts.tv_nsec = 0;
+				} else {
+					ts_subtract(&log_ts, &last_log_ts, &diff_ts);
+				}
+
+				last_log_ts = log_ts;
+
+				ts_add(&target_ts, &diff_ts, &target_ts);
+			} else {
+				ts_add(&target_ts, &sleep_ts, &target_ts);
+			}
 
 			delay_loops++; /* private statistics */
-			gettimeofday(&today_tv, NULL);
 
 		} /* while (!eof) */
 
